@@ -16,5 +16,5 @@ dependencies {
     implementation 'software.amazon.awssdk:dynamodb'
     implementation 'software.amazon.awssdk:s3'
     implementation 'software.amazon.awssdk:transcribe'
-    implementation 'org.json4s:json4s-native_2.13:3.6.9'
+    implementation 'org.json4s:json4s-jackson_2.13:3.6.9'
 }

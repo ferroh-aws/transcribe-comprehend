@@ -18,7 +18,7 @@ Parameters:
   TranscribeLanguageCode:
     Type: String
     Description: The language code used in Amazon Transcribe.
-    Default: es_US
+    Default: es-US
 
 Resources:
   ProcessBucket:
@@ -62,7 +62,7 @@ Resources:
                   - s3:GetObject
                   - s3:PutObject
                 Resource:
-                  - !Sub 'arn:aws:s3:::${ProcessBucketName}/text/*'
+                  - !Sub 'arn:aws:s3:::${ProcessBucketName}/*'
               - Effect: Allow
                 Action:
                   - transcribe:GetTranscriptionJob
