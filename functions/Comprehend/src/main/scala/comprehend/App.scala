@@ -1,17 +1,16 @@
 package comprehend
 
-import java.io.{File, FileOutputStream}
+import java.io.{File, FileOutputStream, PrintWriter}
 import java.nio.file.Paths
-import java.util.Date
+import java.util.UUID
 
 import org.json4s._
 import org.json4s.jackson.JsonMethods._
 import org.json4s.jackson.Serialization
-import org.json4s.jackson.Serialization.write
 import com.amazonaws.services.lambda.runtime.{Context, RequestHandler}
 import com.amazonaws.services.lambda.runtime.events.ScheduledEvent
 import software.amazon.awssdk.services.comprehend.ComprehendClient
-import software.amazon.awssdk.services.comprehend.model.{DetectKeyPhrasesRequest, DetectSentimentRequest}
+import software.amazon.awssdk.services.comprehend.model.{InputDataConfig, InputFormat, OutputDataConfig, StartEntitiesDetectionJobRequest, StartKeyPhrasesDetectionJobRequest, StartSentimentDetectionJobRequest}
 import software.amazon.awssdk.services.dynamodb.DynamoDbClient
 import software.amazon.awssdk.services.dynamodb.model.{AttributeAction, AttributeValue, AttributeValueUpdate, UpdateItemRequest}
 import software.amazon.awssdk.services.s3.S3Client
@@ -26,12 +25,22 @@ import scala.jdk.CollectionConverters._
  * Class used to process CloudWatch events after Transcribe Finishes processing a job.
  */
 class App extends RequestHandler[ScheduledEvent, String] {
-  /** Prefix used to store the analytics JSON files. */
-  val bucketAnalyticsPrefix: String = "analytics/"
+  /** Prefix used to store the entities in the document. */
+  val bucketEntitiesPrefix: String = "entities/"
+  /** Prefix used to store the key phrases. */
+  val bucketKeyPhrasesPrefix: String = "keyPhrases/"
+  /** Prefix used to store the transcription text. */
+  val bucketPlainTranscriptPrefix: String = "transcripts/"
+  /** Prefix used to store the sentiment analysis. */
+  val bucketSentimentPrefix: String = "sentiment/"
+  /** Prefix used to store the topics found. */
+  val bucketTopicsPrefix: String = "topics/"
   /** Name of the bucket containing the data. */
   val bucketName: String = sys.env.getOrElse("BUCKET_NAME", "transcribe-sentiment-poc")
   /** Comprehend client. */
   val comprehendClient: ComprehendClient = ComprehendClient.builder().build()
+  /** Role ARN passed to Comprehend to be able to read the transcripts. */
+  val comprehendRoleArn: String = sys.env("ROLE_ARN")
   /** Client for DynamoDb. */
   val dynamoDbClient: DynamoDbClient = DynamoDbClient.builder().build()
   /** Code for the language to use in Comprehend. */
@@ -54,6 +63,7 @@ class App extends RequestHandler[ScheduledEvent, String] {
    */
   override def handleRequest(input: ScheduledEvent, context: Context): String = {
     val logger = context.getLogger
+    logger.log(s"RoleArn: $comprehendRoleArn")
     val jobId = input.getDetail.get("TranscriptionJobName").toString
     val status = input.getDetail.get("TranscriptionJobStatus").toString
     val time = input.getTime.toInstant.getMillis
@@ -84,44 +94,65 @@ class App extends RequestHandler[ScheduledEvent, String] {
           .build())
         .build()
       response.transcriptionJob().transcript().transcriptFileUri()
-      val transcriptText = processTranscript(jobId)
-      val detectSentimentRequest = DetectSentimentRequest.builder()
+      val (transcriptKey, truncKey, fileSize) = processTranscript(jobId)
+      val s3TranscriptUri = s"s3://$bucketName/$transcriptKey"
+      val inputDataConfig = InputDataConfig.builder()
+        .inputFormat(InputFormat.ONE_DOC_PER_FILE)
+        .s3Uri(s3TranscriptUri)
+        .build()
+      val sentimentInputConfig = InputDataConfig.builder()
+        .inputFormat(InputFormat.ONE_DOC_PER_FILE)
+        .s3Uri(s"s3://$bucketName/${truncKey.getOrElse(transcriptKey)}")
+        .build()
+      val sentimentOutputDataConfig = OutputDataConfig.builder()
+        .s3Uri(s"s3://$bucketName/$bucketSentimentPrefix$jobId/")
+        .build()
+      val startSentimentDetectionJobRequest = StartSentimentDetectionJobRequest.builder()
+        .dataAccessRoleArn(comprehendRoleArn)
+        .inputDataConfig(sentimentInputConfig)
+        .jobName(s"$jobId-Sentiment")
         .languageCode(languageCode)
-        .text(transcriptText)
+        .outputDataConfig(sentimentOutputDataConfig)
         .build()
-      val detectSentimentResponse = comprehendClient.detectSentiment(detectSentimentRequest)
-      item += "sentiment" -> AttributeValueUpdate.builder()
+      val startSentimentDetectionJobResponse = comprehendClient
+        .startSentimentDetectionJob(startSentimentDetectionJobRequest)
+      item += "sentimentJob" -> AttributeValueUpdate.builder()
         .action(AttributeAction.PUT)
-        .value(AttributeValue.builder().s(detectSentimentResponse.sentimentAsString()).build())
+        .value(AttributeValue.builder().s(startSentimentDetectionJobResponse.jobId()).build())
         .build()
-      val detectKeyPhrasesRequest = DetectKeyPhrasesRequest.builder()
+      val keyPhrasesOutputDataConfig = OutputDataConfig.builder()
+        .s3Uri(s"s3://$bucketName/$bucketKeyPhrasesPrefix$jobId/")
+        .build()
+      val startKeyPhrasesDetectionJobRequest = StartKeyPhrasesDetectionJobRequest.builder()
+        .dataAccessRoleArn(comprehendRoleArn)
+        .inputDataConfig(inputDataConfig)
+        .jobName(s"$jobId-KeyPhrases")
         .languageCode(languageCode)
-        .text(transcriptText)
+        .outputDataConfig(keyPhrasesOutputDataConfig)
         .build()
-      val detectKeyPhrasesResponse = comprehendClient.detectKeyPhrases(detectKeyPhrasesRequest)
-      item += "key_phrases" -> AttributeValueUpdate.builder()
+      val startKeyPhrasesDetectionJobResponse = comprehendClient
+        .startKeyPhrasesDetectionJob(startKeyPhrasesDetectionJobRequest)
+      item += "keyPhrasesJob" -> AttributeValueUpdate.builder()
         .action(AttributeAction.PUT)
-        .value(AttributeValue.builder().ss(detectKeyPhrasesResponse.keyPhrases()
-          .asScala.map(keyPhrase => keyPhrase.toString).asJava).build())
+        .value(AttributeValue.builder().s(startKeyPhrasesDetectionJobResponse.jobId()).build())
         .build()
-      val keyPhrases = detectKeyPhrasesResponse.keyPhrases()
-        .asScala
-        .map(keyPhrase => KeyPhrase(keyPhrase.score(), keyPhrase.text()))
-        .toList
-      val outcome = ComprehendOutcome(jobId, new Date(time), status, detectSentimentResponse.sentiment().toString,
-        keyPhrases)
-      val tempFile = File.createTempFile("temp-", "json")
-      val outputStream = new FileOutputStream(tempFile)
-      write(outcome, outputStream)
-      outputStream.flush()
-      outputStream.close()
-      val putObjectRequest = PutObjectRequest.builder()
-        .bucket(bucketName)
-        .contentType("application/json")
-        .key(s"$bucketAnalyticsPrefix$jobId.json")
+      val entitiesDetectionJobResponse = comprehendClient.startEntitiesDetectionJob(
+        StartEntitiesDetectionJobRequest.builder()
+          .dataAccessRoleArn(comprehendRoleArn)
+          .inputDataConfig(inputDataConfig)
+          .jobName(s"$jobId-Entities")
+          .languageCode(languageCode)
+          .outputDataConfig(
+            OutputDataConfig.builder()
+              .s3Uri(s"s3://$bucketName/$bucketEntitiesPrefix$jobId/")
+              .build()
+          )
+          .build()
+      )
+      item += "entitiesJob" -> AttributeValueUpdate.builder()
+        .action(AttributeAction.PUT)
+        .value(AttributeValue.builder().s(entitiesDetectionJobResponse.jobId()).build())
         .build()
-      val putObjectResponse = s3Client.putObject(putObjectRequest, tempFile.toPath)
-      logger.log(putObjectResponse.toString)
     }
     val updateItemRequest = UpdateItemRequest.builder()
       .attributeUpdates(item.result().asJava)
@@ -132,35 +163,48 @@ class App extends RequestHandler[ScheduledEvent, String] {
     "Ok"
   }
 
-  private [this] def processTranscript(jobId: String): String = {
+  /**
+   * Extracts the transcript to prepare it for comprehend.
+   *
+   * @param jobId of the Transcribe process.
+   * @return The S3 key of the file.
+   */
+  private [this] def processTranscript(jobId: String): (String, Option[String], Long) = {
     val getObjectRequest = GetObjectRequest.builder()
       .bucket(bucketName)
       .key(s"$jobId.json")
       .build()
-    val tempFile = Paths.get(sys.env.getOrElse("java.io.tmpdir", "/tmp"), s"$jobId.json")
+    val tempFile = Paths.get(sys.env.getOrElse("java.io.tmpdir", "/tmp"), s"${UUID.randomUUID().toString}.json")
     s3Client.getObject(getObjectRequest, tempFile)
+    tempFile.toFile.deleteOnExit()
     val transcript = parse(Source.fromFile(tempFile.toFile).reader())
-    val text = (transcript \ "results" \ "transcripts")(0) \ "transcript"
-    compact(render(text))
+    val text = compact(render((transcript \ "results" \ "transcripts")(0) \ "transcript"))
+    val textTmpFile = File.createTempFile("transcript-", ".txt")
+    val writer = new PrintWriter(textTmpFile)
+    writer.print(text)
+    writer.flush()
+    writer.close()
+    val key = s"$bucketPlainTranscriptPrefix$jobId.txt"
+    val putObjectRequest = PutObjectRequest.builder()
+      .bucket(bucketName)
+      .contentType("text/plain")
+      .key(key)
+      .build()
+    s3Client.putObject(putObjectRequest, textTmpFile.toPath)
+    val truncKey = if (textTmpFile.length > 5000) {
+      val newKey = s"$bucketPlainTranscriptPrefix$jobId-trunc.txt"
+      val outChan = new FileOutputStream(textTmpFile, true).getChannel
+      outChan.truncate(5000)
+      outChan.close()
+      s3Client.putObject(PutObjectRequest.builder()
+        .bucket(bucketName)
+        .key(newKey)
+        .build()
+        , textTmpFile.toPath)
+      Some(newKey)
+    } else {
+      None
+    }
+    (key, truncKey, textTmpFile.length)
   }
-
-  /**
-   * Case class used to export the results of the comprehend job to S3 as JSON.
-   *
-   * @param id of the process.
-   * @param date of the process.
-   * @param status of the process.
-   * @param sentiment detected on the transcription.
-   * @param keyPhrases in the transcribed document.
-   */
-  sealed case class ComprehendOutcome(id: String, date: Date, status: String, sentiment: String,
-                                      keyPhrases: List[KeyPhrase])
-
-  /**
-   * Case class used to store a key phrase.
-   *
-   * @param score of the key phrase.
-   * @param text of the actual key phrase.
-   */
-  sealed case class KeyPhrase(score: Float, text: String)
 }
