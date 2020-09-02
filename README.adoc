@@ -4,10 +4,16 @@ In this demo we are going to create a process pipeline to transcribe audio files
 This demo uses the "Event Sourcing" pattern to provide a scalable and cost-efficient solution.
 The language for processing is spanish by default, you can change it in the SAM template.
 
+#### Template parameters:
+- ProcessBucketName - Name of the bucket to use for media and text storage.
+- ProcessTableName - Name of the DynamoDB table used to store the process status and outcome.
+- ComprehendLanguageCode - The language code for Amazon Comprehend, one of these https://docs.aws.amazon.com/comprehend/latest/dg/supported-languages.html[languages].
+- TranscribeLanguageCode - The language code for Amazon Transcribe, one of these https://docs.aws.amazon.com/transcribe/latest/dg/what-is-transcribe.html[languages].
+
 ### Prerequisites:
 - AWS Account
 - SAM CLI - https://docs.aws.amazon.com/serverless-application-model/latest/developerguide/serverless-sam-cli-install.html[Install Guide]
-- IAM User with access keys
+- IAM User with access keys and Adminitrator privileges.
 
 ### Services used:
 - https://aws.amazon.com/s3[Amazon Simple Storage Service]
